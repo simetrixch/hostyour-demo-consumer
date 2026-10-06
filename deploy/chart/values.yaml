@@ -4,14 +4,12 @@ image:
   pullPolicy: IfNotPresent
   pullSecretName: hostyour-demo-consumer-registry-pull
 clusterIssuer: ""   # empty: the installation's own, read from global.clusterIssuer
-# Delivered by the platform's consumers ApplicationSet: the unit's host, the manifest's databases
-# (handed as mongodb.databases for every data service) and the redis patterns, empty for an own server.
+# Delivered by the platform's consumers ApplicationSet: the unit's host and the manifest's databases
+# (handed as mongodb.databases for every data service).
 unitHost: ""
 mongodb:
   databases: []
 redis:
-  keyPatterns: []
-  channelPatterns: []
   secretName: hostyour-demo-consumer-redis
 mariadb:
   secretName: hostyour-demo-consumer-mariadb

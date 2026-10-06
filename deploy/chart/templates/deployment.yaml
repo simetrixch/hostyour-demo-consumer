@@ -19,7 +19,10 @@ spec:
       imagePullSecrets:
         - name: {{ .Values.image.pullSecretName }}
       securityContext:
+        # Numeric, because the kubelet cannot verify that a named user is not root.
         runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: app
@@ -39,8 +42,10 @@ spec:
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10
+          # Liveness asks only whether the process serves: an outage of Redis or MariaDB takes the pod
+          # out of the Service (readiness) and does not restart it.
           livenessProbe:
-            httpGet: { path: /healthz, port: http }
+            tcpSocket: { port: http }
             initialDelaySeconds: 20
             periodSeconds: 30
           resources:

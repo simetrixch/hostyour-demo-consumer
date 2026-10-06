@@ -41,3 +41,7 @@ bash scripts/check.sh
 ```
 
 On Windows, `pwsh scripts/check.ps1` runs the same file. It runs the probe's tests and renders the chart for every stage, each with the planted defect it must catch.
+
+**What only the live proof shows.** The tests run the probe against in-memory stand-ins for Redis and MariaDB. Two things therefore stand unproven until the live proof has run: whether the SQL is accepted by a real MariaDB (the upsert and the missing-table answer), and whether the claims are accepted by the platform's provisioner.
+
+**The routes are open.** `PUT /probe` and `GET /probe` take no credential, so anyone who knows the address can overwrite the probe text. The text proves only that what was written before a backup is read after a restore. Write a fresh text right before each proof.

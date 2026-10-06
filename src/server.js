@@ -22,6 +22,7 @@ const MAX_TEXT = 200;
 
 /** The request body as text, refused past MAX_TEXT characters. */
 async function bodyText(req) {
+  req.setEncoding("utf8");
   let text = "";
   for await (const chunk of req) {
     text += chunk;
@@ -47,7 +48,8 @@ createServer(async (req, res) => {
     }
     return send(res, 404, { error: "not found" });
   } catch (err) {
+    // The detail goes to the log only: a driver's message can name the user and the in-cluster address.
     console.error(`${req.method} ${req.url}: ${err.message}`);
-    return send(res, err.status ?? 500, { error: err.message });
+    return err.status ? send(res, err.status, { error: err.message }) : send(res, 500, { error: "the probe failed; see the consumer's log" });
   }
 }).listen(8080, () => console.log("hostyour-demo-consumer listens on 8080"));
