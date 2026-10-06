@@ -1,0 +1,21 @@
+suspended: false
+quiesced: false
+image:
+  pullPolicy: IfNotPresent
+  pullSecretName: hostyour-demo-consumer-registry-pull
+clusterIssuer: ""   # empty: the installation's own, read from global.clusterIssuer
+# Delivered by the platform's consumers ApplicationSet: the unit's host, the manifest's databases
+# (handed as mongodb.databases for every data service) and the redis patterns, empty for an own server.
+unitHost: ""
+mongodb:
+  databases: []
+redis:
+  keyPatterns: []
+  channelPatterns: []
+  secretName: hostyour-demo-consumer-redis
+mariadb:
+  secretName: hostyour-demo-consumer-mariadb
+app:
+  resources:
+    requests: { cpu: "20m", memory: "64Mi" }
+    limits:   { cpu: "200m", memory: "128Mi" }

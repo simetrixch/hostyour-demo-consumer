@@ -1,0 +1,11 @@
+# The pull credential for this consumer's image in the platform's registry (manifest
+# `registry-pull`, ServiceClaim service `registry`).
+apiVersion: platform.hostyour.cloud/v1alpha1
+kind: ServiceClaim
+metadata:
+  name: registry-pull
+  labels:
+    {{- include "demo.labels" . | nindent 4 }}
+spec:
+  service: registry
+  secretName: {{ .Values.image.pullSecretName }}

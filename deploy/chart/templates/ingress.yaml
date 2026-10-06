@@ -1,0 +1,30 @@
+{{- /* No Ingress while the unit is suspended or quiesced: the off state closes the public address. */ -}}
+{{- if not (or .Values.suspended .Values.quiesced) }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hostyour-demo-consumer
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "demo.labels" . | nindent 4 }}
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.clusterIssuer | default (required "global.clusterIssuer is required: the installation names its own certificate authority" .Values.global.clusterIssuer) | quote }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: public
+  tls:
+    - hosts:
+        - {{ include "demo.host" . | quote }}
+      secretName: hostyour-demo-consumer-tls
+  rules:
+    - host: {{ include "demo.host" . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hostyour-demo-consumer
+                port:
+                  number: 8080
+{{- end }}

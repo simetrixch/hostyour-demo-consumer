@@ -1,0 +1,16 @@
+# The consumer's own Redis (manifest `redis: standalone`): the provisioner grants this unit's user its
+# whole server and writes REDIS_URI into the Secret named here. The patterns stay empty for an own
+# server; the platform hands them in for a claim on the shared one.
+apiVersion: platform.hostyour.cloud/v1alpha1
+kind: ServiceClaim
+metadata:
+  name: redis
+  labels:
+    {{- include "demo.labels" . | nindent 4 }}
+spec:
+  service: redis
+  keyPatterns:
+    {{- toYaml .Values.redis.keyPatterns | nindent 4 }}
+  channelPatterns:
+    {{- toYaml .Values.redis.channelPatterns | nindent 4 }}
+  secretName: {{ .Values.redis.secretName }}
