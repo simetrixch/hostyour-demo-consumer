@@ -1,0 +1,707 @@
+<#
+.SYNOPSIS
+  release.ps1 - put a release of this repo on ONE stage, or release a library, which deploys
+  nothing. Lives in release/; copied here by the platform. Bash twin: release.sh (same folder). The
+  two are held to answering identically.
+
+.DESCRIPTION
+  The three inputs are the version (x.y.z), the channel - the maturity CEILING of the release: alpha
+  may reach dev only, beta dev and test, stable anywhere - and the stage this run puts the release
+  on. The channel is part of the release tag; the stage is not. A library takes no stage; `none`
+  says so where a value has to be given, as in the Release workflow's form.
+
+  -Existing puts a release that already stands on origin on the stage and mints nothing: the deploy
+  ref is pushed at that release's own commit, whatever is checked out. It is how a unit goes back to
+  an earlier release (hostyour-manager#299).
+
+  It:
+    1. Validates version, channel and stage.
+    2. Refuses a dirty worktree.
+    3. Reads deploy/platform.yaml: the unit name, the optional platformRepo, and the build names.
+    4. PIN PRE-FLIGHT, only where platformRepo is declared: proves this machine can write that tree
+       BEFORE anything is minted.
+    5. MINT-ONCE: exactly one release tag per (version, channel). The first run stamps the version
+       into package.json where the repo has one, mints <x.y.z>-<channel>-<ts14> (ts14 = UTC
+       yyyyMMddHHmmss) on HEAD and pushes the commit + the tag. A later run for the SAME
+       version+channel REUSES that tag - that is how a release reaches a further stage without being
+       rebuilt: the same commit, the same image, one more stage. A VERSION NAMES ONE COMMIT: a rerun
+       whose tag stands on origin on a commit other than HEAD is refused before any push, and the
+       refusal names the next number to mint (#173).
+    6. Deletes and re-pushes the deploy ref refs/tags/deploy/<stage>/<tag>. The delivery branch
+       deploy/<stage> - the branch the unit's Application renders its chart off - is NOT moved here:
+       the platform places it on the release commit plus its pins once every image exists
+       (hostyour-manager#293). Pushing that ref is the
+       ONLY build trigger. It is deleted first because pushing a ref that already stands changes
+       nothing and fires no webhook, so a repeat of the same (release, stage) would do nothing at
+       all. The deletion fires a webhook too; the platform's trigger drops it.
+    7. Where platformRepo is declared: waits for the release-images run of that tag, because a tag is
+       a name and not a release until the images exist, and then writes the image pin into that tree,
+       on the trunk and on every install branch whose cluster RUNS this unit.
+    8. Where the repository supplies deploy/after-release.sh and .ps1: runs its own spelling last,
+       with the tag, the release commit and the stage (`none` for a library), from the repository
+       root. A failure turns the release red; the release itself stands.
+
+  THE THREE SHAPES THIS ONE SCRIPT SERVES, and what tells them apart. A unit whose manifest declares
+  NO platformRepo is built and pinned by the platform's build plane, which the deploy ref above
+  reaches. Steps 4 and 7 never run for it: no gh, no network beyond its own origin. A unit whose
+  manifest DOES declare platformRepo builds its own images in its own repository and its pins live in
+  a tree only a machine is logged in to for writing, so this script waits and writes them itself. The
+  manifest names that tree, so no person has to remember one, and a copy of this script in another
+  repository names its own there and can reach no other. A LIBRARY is a manifest with no builds, no
+  chart and no tenant: block, the one shape the release pipeline refuses as deploying nothing. No
+  build plane reads a deploy ref of it, so it takes no stage and step 6 does not run: the tag is the
+  release, and the Release workflow publishes its packages.
+
+  The ceiling is checked LOCALLY as a courtesy so a mistake is visible here, but it does NOT stop
+  the push: the pipeline is the only thing that can write, and its refusal - naming channel, stage
+  and the allowed stages - is the one that counts. Every property here is re-verified there.
+
+.EXAMPLE
+  ./release/release.ps1 0.6.000 stable prod
+
+.EXAMPLE
+  ./release/release.ps1 0.5.000 stable prod -Existing
+
+.EXAMPLE
+  ./release/release.ps1 0.3.001 stable
+#>
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true, Position = 0)][string]$Version,
+  # The channel and the stage are validated below and not by ValidateSet: the attribute ignores case,
+  # where the bash twin refuses `Beta`, it stays on the variable and refuses the empty value `none` is
+  # turned into, and its refusal is not the bash twin's sentence.
+  [Parameter(Mandatory = $true, Position = 1)][string]$Channel,
+  [Parameter(Position = 2)][string]$Stage = '',
+  [switch]$Existing
+)
+$ErrorActionPreference = 'Stop'
+# `none` is how a form that must send a value says "no stage" (the Release workflow's choice input).
+if ($Stage -ceq 'none') { $Stage = '' }
+# git's output is read, and this script's own is written, as UTF-8 — what the bash spelling reads and
+# writes — so a path with a non-ASCII byte is the same bytes on both sides.
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+# WHAT THIS SCRIPT PRINTS, AND WHO WRITES THE NEWLINE. Every line it composes is ASCII, a path it names
+# is printed as UTF-8, and every line ends with the
+# one "`n" written here, because neither is the host's to choose. Write-Host and WriteLine end a line
+# with the HOST's ending, which on Windows is two bytes where the bash twin writes one; and
+# [Console]::Error.WriteLine writes in the console's CODE PAGE, which turned a printed em dash into a
+# different byte. Both made the twins answer differently for reasons that have nothing to do with the
+# release, and the two are held to being byte-for-byte the same. Comments carry whatever characters
+# they like; only what is PRINTED is bound.
+#
+# Written straight to the console streams and not through Write-Error, so a refusal reads as the one
+# sentence the bash twin prints rather than as a wrapped error record with a caret diagram over it —
+# and so the exit code is the one chosen here. Under ErrorActionPreference Stop, Write-Error ends the
+# script where it stands, which would make every `exit` after it unreachable.
+function Write-Line($m) { [Console]::Out.Write("$m`n") }
+function Say($m) { Write-Line "release: $m" }
+function Warn($m) { [Console]::Error.Write("release: $m`n") }
+function Note($m) { [Console]::Error.Write("$m`n") }
+function Die($m) { Warn $m; exit 1 }
+
+# THE PIN GRAMMAR AND NOTHING ELSE: builds[]{name,image,tag}, in the values file of the stage this
+# release is going to, and beside a build's tag what its pinValues name. Read and written by name
+# rather than by line, so a file whose entries are ordered differently is still pinned and a file
+# that carries none is left alone. Answers the tree-relative paths whose tag actually moved. The
+# bash twin is the python pinner in release.sh; the two write the same bytes, so every comparison
+# here is ordinal and case-sensitive, as python's are.
+function Write-StagePin {
+  param(
+    [Parameter(Mandatory = $true)][string]$Tree,
+    [Parameter(Mandatory = $true)][string]$PinStage,
+    [Parameter(Mandatory = $true)][string]$ImageTag,
+    [Parameter(Mandatory = $true)][string]$Manifest
+  )
+  $text = [System.IO.File]::ReadAllText($Manifest)
+  $names = @([regex]::Matches($text, '(?m)^\s*-\s*name:\s*(\S+)') | ForEach-Object { $_.Groups[1].Value })
+  # WHAT A BUILD PINS BESIDE ITS TAG: its pinValues, a block of `key: "value"` lines under the build,
+  # each value double-quoted and without a backslash or a double quote in it. Anything else there is
+  # refused before a file is touched: a value read wrong is a value written wrong.
+  $pins = [System.Collections.Generic.Dictionary[string, System.Collections.Specialized.OrderedDictionary]]::new([StringComparer]::Ordinal)
+  $build = $null
+  $top = 0
+  $block = -1
+  $number = 0
+  foreach ($line in $text.Split([char]10)) {
+    $number++
+    if ($line.Trim() -eq '' -or $line.Trim().StartsWith('#', [StringComparison]::Ordinal)) { continue }
+    $depth = $line.Length - $line.TrimStart(' ').Length
+    if ($block -ge 0 -and $depth -gt $block) {
+      $pair = [regex]::Match($line, '^ +([A-Za-z][A-Za-z0-9_-]*): *"([ !#-\[\]-~]*)"\s*(#.*)?$')
+      if (-not $pair.Success -or @('name', 'image', 'tag') -ccontains $pair.Groups[1].Value) {
+        throw ('line {0} is no key: "value" pair of the pinValues of {1}' -f $number, $build)
+      }
+      $pins[$build][$pair.Groups[1].Value] = $pair.Groups[2].Value
+      continue
+    }
+    $block = -1
+    $item = [regex]::Match($line, '^( *)-\s*name:\s*(\S+)')
+    if ($item.Success) {
+      $build = $item.Groups[2].Value
+      $top = $item.Groups[1].Value.Length
+      $pins[$build] = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
+    } elseif ($null -ne $build -and $depth -le $top) {
+      $build = $null
+    } elseif ($null -ne $build -and $line -cmatch '^ *pinValues:') {
+      if ($line -cnotmatch '^ *pinValues:\s*(#.*)?$') {
+        throw ('line {0} writes the pinValues of {1} on one line - write one key: "value" pair per line below it' -f $number, $build)
+      }
+      $block = $depth
+    }
+  }
+  $inventories = Join-Path $Tree 'clusters/inventories'
+  if (-not (Test-Path -LiteralPath $inventories)) { return @() }
+  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+  $touched = @()
+  foreach ($inventory in Get-ChildItem -LiteralPath $inventories -Directory) {
+    $path = Join-Path $inventory.FullName "values-$PinStage.yaml"
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    $lines = [System.Collections.Generic.List[string]]::new([string[]][System.IO.File]::ReadAllText($path).Split([char]10))
+    $image = $null
+    $changed = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+      $imageLine = [regex]::Match($lines[$i], '^(\s*)image:\s*(\S+)\s*$')
+      if ($imageLine.Success) { $image = $imageLine.Groups[2].Value }
+      $tagLine = [regex]::Match($lines[$i], '^(\s*)tag:\s*\S+\s*$')
+      if ($tagLine.Success -and $names -ccontains $image) {
+        $indent = $tagLine.Groups[1].Value
+        $lines[$i] = '{0}tag: "{1}"' -f $indent, $ImageTag
+        # THE ENTRY is every line around the tag at its indentation or deeper, from below the item
+        # line above it to the first shallower line below it. A pin value replaces its key's line
+        # there, and stands right after the tag where the entry carries none.
+        $inside = { param($n) $lines[$n].Trim() -eq '' -or ($lines[$n].Length - $lines[$n].TrimStart(' ').Length) -ge $indent.Length }
+        $first = $i
+        while ($first -gt 0 -and (& $inside ($first - 1))) { $first-- }
+        $after = $i + 1
+        if ($pins.ContainsKey($image)) {
+          foreach ($key in $pins[$image].Keys) {
+            $end = $i + 1
+            while ($end -lt $lines.Count -and (& $inside $end)) { $end++ }
+            $pin = '{0}{1}: "{2}"' -f $indent, $key, $pins[$image][$key]
+            $own = -1
+            for ($n = $first; $n -lt $end; $n++) {
+              if ([regex]::IsMatch($lines[$n], '^' + [regex]::Escape($indent + $key) + ':(\s|$)')) { $own = $n; break }
+            }
+            if ($own -ge 0) { $lines[$own] = $pin } else { $lines.Insert($after, $pin); $after++ }
+          }
+        }
+        $i = $after - 1
+        $image = $null
+        $changed = $true
+      }
+    }
+    # WRITTEN ONLY WHERE A TAG MOVED. A file compared by its whole text is a file rewritten for a
+    # trailing newline, and a commit that names files it did not change is one nobody can read.
+    if ($changed) {
+      [System.IO.File]::WriteAllText($path, ($lines -join "`n"), $utf8NoBom)
+      $touched += ([System.IO.Path]::GetRelativePath($Tree, $path) -replace '\\', '/')
+    }
+  }
+  return $touched
+}
+
+# Does this unit run on a cluster whose role is the one given? A role names every PART the cluster
+# carries — a master carries the slave part as well — while runsOn names the ONE part a workload
+# belongs to, so the match is against the parts, exactly as the platform-apps ApplicationSet's In
+# selector matches them, and every-cluster belongs on all of them. A unit answers for every build
+# it has: any one of them running on that cluster puts the pin on its branch.
+function Test-RunsHere {
+  param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Role)
+  $parts = if ($Role -eq 'master') { @('master', 'slave') } else { @($Role) }
+  foreach ($where in $runsOn) {
+    if ($where -eq 'every-cluster') { return $true }
+    if ($parts -contains $where) { return $true }
+  }
+  return $false
+}
+
+# One branch of the platform tree, pinned and pushed. The checkout and the reset onto the remote
+# branch are what make the write land on THAT branch and not on whatever the clone had open.
+#
+# THE SUBJECT OPENS WITH `release:` because the platform's push gate excuses a release stamp from
+# naming an issue by that word and by nothing else. The clone below carries no hooks, so the gate
+# never judges this commit here — but it judges it wherever the same commit is pushed from a
+# checkout that does, and a commit the gate refuses from one place is a commit it should refuse
+# from every place (#132).
+#
+# THE BRANCH IS READ AGAIN BEFORE EVERY ATTEMPT. A release waits minutes for its images, and the
+# Manager commits to an install branch meanwhile (an onboarding, an offboard): a push onto the head
+# this clone saw at its start is then refused, so the pin is written onto the head the remote has
+# now and pushed again. A pin that already stands — a rerun — writes nothing and is done.
+function Publish-BranchPin {
+  param([Parameter(Mandatory = $true)][string]$Branch)
+  git -C $platformRepoDir checkout --quiet $Branch 2>$null
+  if ($LASTEXITCODE -ne 0) { Die "the platform tree has no branch $Branch - nothing further was pinned" }
+  for ($attempt = 1; $attempt -le 5; $attempt++) {
+    git -C $platformRepoDir fetch --quiet origin $Branch
+    if ($LASTEXITCODE -ne 0) { Die "the branch $Branch of $platformRepo could not be fetched - nothing further was pinned" }
+    git -C $platformRepoDir reset --quiet --hard "origin/$Branch"
+    if ($LASTEXITCODE -ne 0) { Die "the branch $Branch of $platformRepo could not be reset - nothing further was pinned" }
+    try { $pinned = @(Write-StagePin -Tree $platformRepoDir -PinStage $Stage -ImageTag "$tag-$sha7" -Manifest $manifest) }
+    catch { Die "the pin of $Stage could not be written: $($_.Exception.Message) - the images are built and nothing was pinned" }
+    if ($pinned.Count -eq 0) {
+      Say "$Branch carries no values-$Stage.yaml pin of $name - left as it stands"
+      return
+    }
+    git -C $platformRepoDir add -- @pinned
+    if ($LASTEXITCODE -ne 0) { Die "the pin of $Stage could not be staged - nothing further was pinned" }
+    git -C $platformRepoDir diff --cached --quiet
+    if ($LASTEXITCODE -eq 0) {
+      Say "$Branch is pinned to $tag-$sha7 already - nothing to write"
+      $script:pinnedAny = $true
+      return
+    }
+    git -C $platformRepoDir commit --quiet -m "release: pin $Stage to $tag" -m "Written by the release of $name, once its images were built."
+    if ($LASTEXITCODE -ne 0) { Die "the pin of $Stage could not be committed - nothing further was pinned" }
+    git -C $platformRepoDir push --quiet origin $Branch
+    if ($LASTEXITCODE -eq 0) {
+      Say "pinned $Branch to $tag-$sha7 in $($pinned -join ' ')"
+      $script:pinnedAny = $true
+      return
+    }
+    Say "$Branch of $platformRepo moved on while this release waited (attempt $attempt of 5) - pinning again onto its new head"
+  }
+  Die "the pin of $Stage to $tag-$sha7 could not be pushed to $Branch of $platformRepo in 5 attempts"
+}
+
+# THE COMMIT A TAG SITS ON DECLARES THE VERSION THE TAG NAMES. The build reads the version out of
+# the tag, so a package.json still declaring an older number labels the artifact with a version
+# nobody released. The write happens BEFORE the tag is created: a tag placed first would point at
+# the commit that still carries the old number, and a release does not move a tag afterwards.
+# EVERY package.json the repository tracks is stamped, in the one commit: a workspace publishes its
+# packages at the numbers they declare, and a package left at an older number is skipped by a publish
+# that finds that number already published.
+# Only the FIRST "version" line of a file is touched. That is the manifest's own; a version further
+# down belongs to a dependency and is not this release's to move. The file keeps its line endings and
+# its byte order mark. Paths come unquoted, so a name with a non-ASCII byte is the file itself.
+# A repository with no package.json, or a file that declares no version, has nothing that could go
+# stale — that is said out loud and the release continues, because a unit written in another
+# language is the ordinary case for this script and not a broken one.
+# EVERY package.json carries the version in the package manager's strict form: npm refuses to
+# publish a version with a leading zero, and pnpm matches no workspace:* dependency to a package
+# that declares one (pnpm deploy fails on it), so 0.3.000 is written 0.3.0 and 0.3.001 is written
+# 0.3.1. The tag and the images keep the release version as it is.
+# A beta or an alpha carries its channel as the prerelease part, 0.3.1-beta: mint-once allows one
+# release per version AND channel, so a beta and a stable of one version are two commits, and a
+# registry that holds 0.3.1 for the first would skip the second as published. A caret range never
+# matches a prerelease, so a consumer on ^0.3.0 is not moved onto a beta.
+function Set-ManifestVersion($Root, $Version, $Tag) {
+  $packageVersion = $Version -replace '\.0*(\d+)$', '.$1'
+  if ($Channel -cne 'stable') { $packageVersion = "$packageVersion-$Channel" }
+  $manifests = @(git -c core.quotePath=false -C $Root ls-files -- 'package.json' '*/package.json')
+  if ($manifests.Count -eq 0) {
+    Say 'this repository carries no package.json - no version manifest to stamp'
+    return
+  }
+  $rx = [regex]'(?m)^(\s*)"version":\s*"[^"]*"'
+  $stamped = @()
+  foreach ($rel in $manifests) {
+    $file = Join-Path $Root $rel
+    $bytes = [System.IO.File]::ReadAllBytes($file)
+    $hasBom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $text = [System.IO.File]::ReadAllText($file)
+    if (-not $rx.IsMatch($text)) {
+      Say "$rel declares no version - nothing to stamp"
+      continue
+    }
+    $declared = $packageVersion
+    $bumped = $rx.Replace($text, '$1"version": "' + $declared + '"', 1)
+    if ($bumped -eq $text) { continue }
+    [System.IO.File]::WriteAllText($file, $bumped, [System.Text.UTF8Encoding]::new($hasBom))
+    # --force: the file is tracked (ls-files listed it), and git refuses to add a tracked file that
+    # stands in a directory a .gitignore names, as packages/storage/ under a `storage/` rule.
+    git add --force -- $file
+    if ($LASTEXITCODE -ne 0) { Die "the version bump to $Version could not be staged" }
+    $stamped += "$declared $rel"
+  }
+  if ($stamped.Count -eq 0) { return }
+  git commit --quiet -m "release: $Tag"
+  if ($LASTEXITCODE -ne 0) { Die "the version bump to $Version could not be committed" }
+  foreach ($line in $stamped) {
+    $declared, $rel = $line -split ' ', 2
+    Say "$rel declares $declared"
+  }
+}
+
+if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.[0-9]{3}$') {
+  Die "version must be x.y.z, the third position three digits such as 000 (got '$Version')"
+}
+if (@('stable', 'beta', 'alpha') -cnotcontains $Channel) { Die "channel must be stable|beta|alpha (got '$Channel')" }
+if (@('', 'dev', 'test', 'prod') -cnotcontains $Stage) { Die "stage must be dev|test|prod, or none for a library (got '$Stage')" }
+
+# The courtesy ceiling check. It WARNS and continues on purpose — see the description. A release
+# without a stage reaches none, so there is no ceiling to hold it against.
+if ($Stage) {
+  $admits = @{ alpha = @('dev'); beta = @('dev', 'test'); stable = @('dev', 'test', 'prod') }[$Channel]
+  if ($admits -notcontains $Stage) {
+    Warn "WARNING - channel $Channel admits only: $($admits -join ' '). Stage $Stage is above its ceiling, so the platform will refuse this run. Pushing anyway; the refusal comes from the pipeline."
+  }
+}
+
+git rev-parse --is-inside-work-tree 2>$null | Out-Null
+if ($LASTEXITCODE -ne 0) { Die 'not inside a git repository' }
+if (git status --porcelain) { Die 'worktree is dirty - commit or stash before releasing' }
+
+# Anchor the manifest read at the repo root so it resolves whether the script is run from the
+# repo root or from inside release/ (git tag/push are already repo-relative, not cwd-relative).
+$root = (git rev-parse --show-toplevel 2>$null)
+if (-not $root) { $root = '.' }
+$manifest = "$root/deploy/platform.yaml"
+
+$name = ''
+$platformRepo = ''
+$buildNames = @()
+if (Test-Path -LiteralPath $manifest) {
+  $manifestText = [System.IO.File]::ReadAllText($manifest)
+  $nameLine = [regex]::Match($manifestText, '(?m)^name:[ \t]*(\S+)')
+  if ($nameLine.Success) { $name = $nameLine.Groups[1].Value }
+  $repoLine = [regex]::Match($manifestText, '(?m)^platformRepo:[ \t]*(\S+)')
+  if ($repoLine.Success) { $platformRepo = $repoLine.Groups[1].Value }
+  # The build names of the top-level `builds:` block and of nothing else: a tenant block lists its
+  # members with `- name:` lines too, and those are no images. Read in block style, as every manifest
+  # writes the list.
+  $inBuilds = $false
+  foreach ($manifestLine in ($manifestText -split "`n")) {
+    if ($manifestLine -cmatch '^[^\s#]') { $inBuilds = $manifestLine -cmatch '^builds:' }
+    elseif ($inBuilds -and $manifestLine -cmatch '^\s*-\s*name:\s*(\S+)') { $buildNames += $Matches[1] }
+  }
+}
+if (-not $name) { Die "the manifest $manifest states no name - it is what the release line and any pin are written under" }
+
+# A LIBRARY DEPLOYS NOTHING, so it takes no stage, and everything else is put on one. The test is the
+# release pipeline's own: a manifest with no builds, no chart and no tenant block deploys nothing.
+# Both mismatches are refused here, before anything is minted or pushed.
+$library = $buildNames.Count -eq 0 -and $manifestText -cnotmatch '(?m)^chart:' -and $manifestText -cnotmatch '(?m)^tenant:'
+if ($library) {
+  if ($Stage) { Die "$name declares no builds, no chart and no tenant block, so a release of it deploys nothing and takes no stage - release it without one. Nothing was pushed." }
+  if ($Existing) { Die "--existing puts a release that stands on origin on a stage again, and $name deploys nothing. Nothing was pushed." }
+}
+elseif (-not $Stage) {
+  Die "$name declares builds, a chart or a tenant block, so a release of it is put on a stage - name dev, test or prod. Nothing was pushed."
+}
+
+# THE REPOSITORY'S OWN STEP AFTER THE RELEASE. A repository that needs one more act after every release
+# supplies deploy/after-release.sh and deploy/after-release.ps1. They stand outside release/, which a
+# kit replace rewrites whole, so the replace never takes them away. Each spelling runs its own twin,
+# so a repository carrying only one would release differently on Linux and Windows: refused here,
+# before anything is minted or pushed. The step runs last, with the tag, the release commit and the
+# stage (`none` for a library), from the repository root, in a pwsh of its own so its exit code is
+# what it chose. A failure turns the release red, and the release itself stands.
+$afterReleaseSh = Test-Path -LiteralPath (Join-Path $root 'deploy/after-release.sh') -PathType Leaf
+$afterReleasePs1 = Test-Path -LiteralPath (Join-Path $root 'deploy/after-release.ps1') -PathType Leaf
+if ($afterReleaseSh -and -not $afterReleasePs1) {
+  Die "deploy/after-release.sh stands without its twin deploy/after-release.ps1 - each release script runs its own spelling, so a repository supplies both or neither. Nothing was pushed."
+}
+if ($afterReleasePs1 -and -not $afterReleaseSh) {
+  Die "deploy/after-release.ps1 stands without its twin deploy/after-release.sh - each release script runs its own spelling, so a repository supplies both or neither. Nothing was pushed."
+}
+function Invoke-AfterRelease($Tag, $Sha) {
+  if (-not $afterReleasePs1) { return }
+  $stageArgument = if ($Stage) { $Stage } else { 'none' }
+  Say "running deploy/after-release $Tag $Sha $stageArgument"
+  $pwshPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+  # Started as a process of its own and not with `&`: `&` would hand its standard output to this
+  # script's pipeline, where the host rewrites every line ending, while a started process writes to
+  # the handles this one inherited, byte for byte, as the shell twin's child does.
+  $step = Start-Process -FilePath $pwshPath -ArgumentList @('-NoProfile', '-NonInteractive', '-File', 'deploy/after-release.ps1', $Tag, $Sha, $stageArgument) -WorkingDirectory $root -NoNewWindow -Wait -PassThru
+  if ($step.ExitCode -ne 0) {
+    $released = if ($library) { 'is released' } else { 'is released and its deploy ref is pushed' }
+    Die "deploy/after-release failed with exit $($step.ExitCode) - $Tag $released; only the after-release step is missing: run it again once fixed"
+  }
+}
+
+# ── The pin pre-flight ────────────────────────────────────────────────────────────────────────
+#
+# A RELEASE THAT CANNOT WRITE ITS PIN IS REFUSED BEFORE IT MINTS ANYTHING. Everything below this
+# point mutates something somebody else reads: a version commit on the default branch, a release
+# tag, and a deploy ref whose push is what starts the build. Discovering only afterwards that the
+# platform tree is unreachable leaves a release that exists, was built, and reaches no stage — and
+# the tag cannot be minted a second time, so the repair is by hand.
+#
+# THE PUSH IS PROBED, NOT THE CLONE. The platform tree may be public, so a clone proves nothing
+# about write access; `git push --dry-run` performs the same reference discovery a real push does
+# against the remote's receive side, which is refused without write access either way. It sends no
+# update. GIT_TERMINAL_PROMPT=0 turns a machine holding no credential into a refusal instead of a
+# process waiting on a prompt nobody is watching.
+#
+# THE TREE IS CLONED FRESH and reused for the write below. Nothing here depends on where a checkout
+# happens to sit on the machine, and nothing here can touch one. Everything from here to the end of
+# the script stands inside one try/finally — this spelling of the bash twin's EXIT trap, because
+# PowerShell runs a finally for `exit` and for a terminating error alike — so the clone is removed
+# on every path out, the refusals included.
+$platformRepoDir = ''
+$runsOn = @()
+try {
+  if ($platformRepo) {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+      Die "gh is not on this path, so the build of this release could not be waited for and its pin could not be written - nothing has been minted or pushed"
+    }
+    $platformRepoDir = (New-Item -ItemType Directory -Path (Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName()))).FullName
+    git clone --quiet "https://github.com/$platformRepo.git" $platformRepoDir
+    if ($LASTEXITCODE -ne 0) { Die "the platform tree $platformRepo could not be cloned, so this release could not write its pin - nothing has been minted or pushed" }
+    $priorPrompt = $env:GIT_TERMINAL_PROMPT
+    $env:GIT_TERMINAL_PROMPT = '0'
+    try { git -C $platformRepoDir push --dry-run --quiet origin HEAD *> $null }
+    finally {
+      if ($null -eq $priorPrompt) { Remove-Item Env:GIT_TERMINAL_PROMPT } else { $env:GIT_TERMINAL_PROMPT = $priorPrompt }
+    }
+    if ($LASTEXITCODE -ne 0) {
+      Die "this machine may not push to $platformRepo, so this release could not write its pin - nothing has been minted or pushed. A unit that pins itself is released from a machine logged in to both repositories, never from a build runner."
+    }
+    # WHERE THE UNIT RUNS, which is what decides which branches its pin belongs on. The platform
+    # states it PER BUILD and not per unit, and the two are different names: a manifest's name is the
+    # unit, its builds[].name are the workloads, and clusters/inventories is keyed by the workload.
+    # This unit is called hostyour-manager and its charts are manager and gate-runner, so a lookup
+    # under the unit's own name finds nothing at all.
+    #
+    # ANY BUILD THAT RUNS SOMEWHERE PUTS THE PIN THERE. The pin is written per build into one values
+    # file, so a branch reads it if any build of this unit runs on that cluster. A build carrying no
+    # chart - an image a job pulls, never a workload - names no cluster and contributes nothing.
+    $found = @()
+    foreach ($build in ([regex]::Matches((Get-Content -Raw $manifest), '(?m)^[ \t]*-[ \t]*name:[ \t]*(\S+)') | ForEach-Object { $_.Groups[1].Value })) {
+      $appYaml = "clusters/inventories/$build/app.yaml"
+      $line = [regex]::Match(((git -C $platformRepoDir show "origin/master:$appYaml" 2>$null) -join "`n"), '(?m)^runsOn:[ \t]*(\S+)')
+      if ($line.Success) { $found += $line.Groups[1].Value }
+    }
+    $runsOn = ($found | Sort-Object -Unique)
+    if (-not $runsOn) {
+      Die "no build of $name carries a clusters/inventories/<build>/app.yaml on the trunk of $platformRepo that states runsOn, so where this unit runs is unknown and its pin belongs to no branch in particular - nothing has been minted or pushed"
+    }
+    Say "$name runs on: $($runsOn -join ' ')"
+  }
+
+  # Remote view first: mint-once has to see the tags other people pushed, or a second machine would
+  # mint a second tag for the same version+channel instead of reusing the one that exists.
+  git fetch --tags --quiet origin 2>$null | Out-Null
+
+  $prefix = "$Version-$Channel-"
+  $releaseTags = @(git tag -l "$prefix*" | Sort-Object)
+  $headSha = (git rev-parse --verify HEAD | Select-Object -First 1)
+
+  # THE RELEASE COMMIT GOES WHERE THE BRANCH TRACKS. A bare `git push origin HEAD` pushes to the remote
+  # branch of the local branch's own name, so a branch that tracks origin/master under another name, as
+  # an issue worktree's does, would put the release commit on a new branch and never on master. A branch
+  # that tracks nothing on origin keeps its own name.
+  $upstream = (git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>$null | Select-Object -First 1)
+  $releasePush = if ($LASTEXITCODE -eq 0 -and "$upstream".StartsWith('origin/')) { "HEAD:refs/heads/$("$upstream".Substring(7))" } else { 'HEAD' }
+
+  # A TAG THAT NEVER REACHED ORIGIN AND NAMES ANOTHER COMMIT IS RESIDUE, and reusing it aims every
+  # retry at the commit a refused push left behind. The tag is minted before it is pushed, so a push
+  # the pre-push hook refuses leaves it standing here and nowhere else; the next run finds it, reuses
+  # it, and is refused again — for the same reason, printed as if it were about the new attempt.
+  #
+  # A TAG THAT IS ON ORIGIN IS LEFT EXACTLY AS IT STANDS, whatever commit it names. That is mint-once
+  # itself, and the reuse below relies on it: one release per version+channel, put on a further stage
+  # without rebuilding.
+  if ($releaseTags.Count -gt 0) {
+    $candidate = $releaseTags[-1]
+    git ls-remote --exit-code --tags origin "refs/tags/$candidate" *> $null
+    $onOrigin = ($LASTEXITCODE -eq 0)
+    $candidateSha = (git rev-parse --verify --quiet "$candidate^{commit}" | Select-Object -First 1)
+    if (-not $onOrigin -and "$candidateSha" -ne "$headSha") {
+      $candidateShort = (git rev-parse --short=7 "$candidate^{commit}" | Select-Object -First 1)
+      Say "$candidate stands on this machine only and names $candidateShort, not the commit being released. A run whose push was refused left it behind; it is dropped and cut again."
+      git tag -d $candidate *> $null
+      if ($LASTEXITCODE -ne 0) {
+        Die "the leftover tag $candidate could not be dropped, and reusing it would release a commit nobody is releasing"
+      }
+      $releaseTags = @()
+    }
+  }
+
+  # -Existing PUTS ONLY WHAT WAS RELEASED: the release has to stand on origin, because the deploy ref is
+  # pushed at its commit and a tag that never left this machine is no release anybody built.
+  if ($Existing) {
+    $released = $false
+    if ($releaseTags.Count -gt 0) {
+      git ls-remote --exit-code --tags origin "refs/tags/$($releaseTags[-1])" *> $null
+      $released = ($LASTEXITCODE -eq 0)
+    }
+    if (-not $released) {
+      Die "no release $Version-$Channel stands on origin, so there is none to put on $Stage. Nothing was pushed."
+    }
+  }
+
+  # A VERSION NAMES ONE COMMIT. A tag that survived the residue rule and names a commit other than
+  # HEAD is on origin, and origin's tag is the release: what stands at HEAD is a different tree, and
+  # the version cannot name both. Reusing the tag would push its commit as the deploy ref from
+  # a checkout standing elsewhere - a push the organisation's pre-push hook refuses as "not what is
+  # checked out", after the tag was reused and in words about the deploy ref. So the refusal
+  # is here, before any push, and it names the next number: a commit that failed its own push is
+  # not repaired under its number but succeeded by the next one (#173). The next number is the
+  # patch plus one. This script reads no other repository, so where one sequence spans several, the
+  # person holds that the number is still free.
+  if (-not $Existing -and $releaseTags.Count -gt 0 -and "$candidateSha" -ne "$headSha") {
+    $parts = $Version.Split('.')
+    # Three digits stay three digits: 0.3.007 is followed by 0.3.008.
+    $nextPatch = [int]$parts[2] + 1
+    if ($nextPatch -gt 999) { Die "$Version is burnt and its next patch exceeds three digits - choose another version. Nothing was pushed." }
+    $next = "$($parts[0]).$($parts[1]).$($nextPatch.ToString('000'))"
+    $candidateShort = (git rev-parse --short=7 "$candidate^{commit}" | Select-Object -First 1)
+    $headShort = (git rev-parse --short=7 HEAD | Select-Object -First 1)
+    Die "$candidate stands on origin at $candidateShort and HEAD is $headShort. A version names one commit, so $Version is burnt: release $next instead. Nothing was pushed."
+  }
+
+  if ($releaseTags.Count -gt 0) {
+    $tag = $releaseTags[-1]
+    # A TAG ON HEAD THAT NEVER REACHED ORIGIN IS THE RELEASE WITH ITS PUSH STILL OWED (#227): the mint
+    # pushed HEAD and the run was cut before the tag's own push landed. Reusing it silently would fire
+    # no build and pin nothing; it is pushed now, and the rest of the run proceeds as a reuse.
+    git ls-remote --exit-code --tags origin "refs/tags/$tag" *> $null
+    if ($LASTEXITCODE -ne 0) {
+      Say "$tag stands on this machine only, on the commit being released - its push never reached origin; pushed now"
+      git push origin $releasePush
+      if ($LASTEXITCODE -ne 0) { Die "the release commit for $tag could not be pushed - deploy/after-release was not run" }
+      git push origin "refs/tags/$tag"
+      if ($LASTEXITCODE -ne 0) { Die "the release tag $tag could not be pushed - deploy/after-release was not run" }
+    }
+    if ($library) {
+      Say "reusing the existing release $tag - one release per version+channel, so nothing is minted"
+    }
+    else {
+      Say "reusing the existing release $tag - one release per version+channel, so putting it on $Stage rebuilds nothing"
+    }
+  }
+  else {
+    $ts14 = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmss')
+    $tag = "$Version-$Channel-$ts14"
+    Set-ManifestVersion $root $Version $tag
+    git tag -a $tag -m "release $tag"
+    if ($LASTEXITCODE -ne 0) { Die "the release tag $tag could not be created - nothing was pushed" }
+    git push origin $releasePush
+    if ($LASTEXITCODE -ne 0) { Die "the release commit for $tag could not be pushed - deploy/after-release was not run" }
+    git push origin "refs/tags/$tag"
+    if ($LASTEXITCODE -ne 0) { Die "the release tag $tag could not be pushed - deploy/after-release was not run" }
+    Say "minted $tag"
+  }
+
+  # The release COMMIT is the tag's. The rule above makes it HEAD as well, so every push below sends
+  # what is checked out - except under -Existing, where the deploy ref names the release's own commit.
+  $sha = (git rev-list -n 1 $tag).Trim()
+  $sha7 = $sha.Substring(0, 7)
+
+  # A LIBRARY IS RELEASED BY ITS TAG. No build plane reads a deploy ref of it and nothing is pinned, so
+  # the run ends here; the Release workflow's publish job reads the tag.
+  if ($library) {
+    Invoke-AfterRelease $tag $sha
+    Say "$name $tag (commit $sha7) is released; nothing is deployed"
+    return
+  }
+
+  # THE DELIVERY BRANCH IS NOT MOVED HERE. The unit's Application follows deploy/<stage>, and the
+  # platform's release pipeline places it on the release commit plus the pin commit once every image
+  # of this release exists (hostyour-manager#293). Moved here, before the build, it let a cluster
+  # render the release tree with its placeholder tags, and a build that failed left them standing.
+
+  $deployRef = "refs/tags/deploy/$Stage/$tag"
+  # Delete first (absent on a first deploy — that is the normal case, not an error), then push: the
+  # push is what the platform's webhook reacts to.
+  git push origin ":$deployRef" 2>$null | Out-Null
+  git push origin "${sha}:$deployRef"
+  if ($LASTEXITCODE -ne 0) { Die "the deploy ref $deployRef could not be pushed - $tag is released; deploy/after-release was not run" }
+
+  # ── The build, waited for, and the pin it makes true ────────────────────────────────────────
+  #
+  # THE TAG IS A NAME AND NOT A RELEASE UNTIL THE IMAGES EXIST. Pushing it starts the workflow that
+  # builds them (.github/workflows/release-images.yml); until that is green there is nothing to pin
+  # a cluster to, and a pin written earlier names an image a kubelet answers with ImagePullBackOff.
+  # So this waits, and only then writes.
+  #
+  # WHY THE WRITE IS HERE AND NOT IN THE WORKFLOW. The pin lives in ANOTHER repository, and a
+  # workflow's own token reaches only the one it runs in — a cross-repository write needs a
+  # credential somebody has to make, hold and replace. This script runs on a machine that is already
+  # logged in to both. The credential problem does not exist here, so neither does the credential.
+  #
+  # EVERY PATH THAT DOES NOT PIN ENDS THE RUN. A release that says it is on its way to a stage while
+  # the tree that stage reads still names the previous images is telling the operator something that
+  # is not so, and the machine is where they find out.
+  if (-not $platformRepo) {
+    Say "the manifest $manifest names no platformRepo, so nothing is pinned from here - the deploy ref above is what the platform reacts to"
+  }
+  else {
+    Say "waiting for the images of $tag - the pin is written when they exist"
+    $runId = ''
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+      $runId = (gh run list --workflow release-images --branch $tag --limit 1 --json databaseId --jq '.[0].databaseId' 2>$null | Select-Object -First 1)
+      if ($runId) { $runId = "$runId".Trim() }
+      if ($runId) { break }
+      Start-Sleep -Seconds 4
+    }
+    if (-not $runId) {
+      Die "no release-images run appeared for $tag within two minutes - the images are unbuilt and nothing was pinned"
+    }
+    gh run watch $runId --exit-status --interval 20 *> $null
+    if ($LASTEXITCODE -ne 0) {
+      # 75 and not Die's 1: a build that ran and failed is a different answer from a release that
+      # was refused, and the bash twin says so with the same number.
+      # THE REASON IS PRINTED HERE, not left to a command somebody is told to run next. Whoever
+      # reads this failure is standing at a terminal with the credential already in hand, and a
+      # release that sends them one round trip away for the cause has answered nothing. The FAILED
+      # STEPS and not the whole log: a green build is thousands of lines and they bury the rest.
+      Note "----- the failed steps of run $runId -----"
+      $log = (gh run view $runId --log-failed 2>&1 | Select-Object -Last 120)
+      if ($log) { $log | ForEach-Object { Note $_ } }
+      else { Note "the log of run $runId could not be read" }
+      Note "----- end of run $runId -----"
+      Warn "the images of $tag did not build - no pin was written"
+      exit 75
+    }
+    Say "the images of $tag are built"
+    # The clone is as old as the pre-flight, which stands before a build that takes minutes. Refresh
+    # the remote-tracking refs, or the reset below writes onto a tip somebody else has moved past and
+    # the push is refused for a reason that has nothing to do with this release.
+    git -C $platformRepoDir fetch --quiet --prune origin
+    if ($LASTEXITCODE -ne 0) { Die "the platform tree $platformRepo could not be refreshed after the build - the images exist and nothing was pinned" }
+
+    # EVERY BRANCH A CLUSTER ACTUALLY READS, and the trunk they are cut from.
+    #
+    # A cluster's ArgoCD tracks its own INSTALL BRANCH — the root application's targetRevision is
+    # the cluster's domain, not the default branch and not a tag — so a pin written only on the
+    # trunk is a pin no machine ever sees. It is written on the trunk as well, because an install
+    # branch that is regenerated later takes what stands there.
+    #
+    # WHICH INSTALL BRANCHES: the ones whose cluster RUNS this unit. A branch states its role in
+    # clusters/active/<branch>.yaml, which is read here without checking the branch out, and the unit
+    # states its runsOn in its inventory — the same two facts the platform-apps ApplicationSet
+    # matches to decide which workloads a cluster renders. A cluster that runs no copy of this unit
+    # is passed over, because a pin on its branch moves a value nothing there reads.
+    #
+    # ASKING WHETHER THE BRANCH IS A MASTER instead is a different question with the same answer
+    # today, and a wrong answer on the first unit that declares runsOn: slave or every-cluster and
+    # carries a build: its pin would reach no slave branch at all, and the release would report
+    # itself on its way to the stage while the machines that run it kept the previous image.
+    $pinnedAny = $false
+    Publish-BranchPin -Branch 'master'
+    foreach ($ref in (git -C $platformRepoDir for-each-ref --format='%(refname:strip=3)' refs/remotes/origin)) {
+      if ($ref -eq 'master' -or $ref -eq 'HEAD') { continue }
+      $map = (git -C $platformRepoDir show "origin/${ref}:clusters/active/$ref.yaml" 2>$null)
+      $roleLine = [regex]::Match(($map -join "`n"), '(?m)^role:[ \t]*(.*)$')
+      $role = if ($roleLine.Success) { $roleLine.Groups[1].Value.Trim() } else { '' }
+      if (-not $role) {
+        Say "$ref carries no clusters/active/$ref.yaml, so it is no cluster's install branch - passed over"
+      }
+      elseif (Test-RunsHere -Role $role) {
+        Publish-BranchPin -Branch $ref
+      }
+      else {
+        Say "$ref carries the $role part and $name runs on $runsOn - passed over"
+      }
+    }
+    if (-not $pinnedAny) {
+      Die "no branch of $platformRepo carries a values-$Stage.yaml pin of $name - the images are built and no cluster reads them, so this release reaches nothing"
+    }
+  }
+
+  Invoke-AfterRelease $tag $sha
+  Say "$name $tag (commit $sha7) is on its way to $Stage"
+  if ($buildNames.Count -gt 0) {
+    Say 'the platform builds these image tags, or skips the build when they already exist:'
+    foreach ($build in $buildNames) {
+      Write-Line "    ${build}:$tag-$sha7"
+    }
+  }
+}
+finally {
+  if ($platformRepoDir) { Remove-Item -Recurse -Force -LiteralPath $platformRepoDir -ErrorAction SilentlyContinue }
+}
