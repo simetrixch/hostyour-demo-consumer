@@ -1,4 +1,4 @@
-# The demo consumer's image, run as the image's unprivileged user.
+# The demo consumer's image: the app and its two clients, run as the image's unprivileged user.
 FROM node:22-alpine
 WORKDIR /app
 COPY package.json package-lock.json ./

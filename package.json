@@ -2,13 +2,15 @@
   "name": "hostyour-demo-consumer",
   "version": "0.1.0",
   "private": true,
-  "description": "A demo consumer of the hostyour platform: one pod with no data service.",
+  "description": "A demo consumer of the hostyour platform: one Redis key and one MariaDB row, written and read back.",
   "type": "module",
-  "engines": {
-    "node": ">=22"
-  },
+  "engines": { "node": ">=22" },
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "mysql2": "3.24.5",
+    "redis": "6.3.0"
   }
 }

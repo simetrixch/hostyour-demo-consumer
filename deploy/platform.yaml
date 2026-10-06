@@ -1,6 +1,6 @@
-# The demo consumer of the hostyour platform: one pod with no data service, the slimmest unit the
-# Manager onboards, so a stage's lifecycle (onboard, add a stage, offboard, restore) can be proven live
-# at the smallest size.
+# The demo consumer of the hostyour platform. It brings its own Redis and its own MariaDB, so a
+# backup and a restore of a consumer's data services can be proven live by reading back what was
+# written before (README.md, "The live proof").
 apiVersion: hostyour.cloud/v1
 kind: ConsumerManifest
 name: hostyour-demo-consumer
@@ -9,7 +9,18 @@ owner: platform
 envs: [dev, test]
 chart:
   path: deploy/chart
-services: [registry-pull]
+services: [redis, mariadb, registry-pull]
+# Its own Redis server, which nothing else shares; the probe key lives there.
+redis: standalone
+# The one MariaDB database the probe's table lives in.
+databases: [demo_probe]
 builds:
   - name: hostyour-demo-consumer
     containerfile: Containerfile
+secrets:
+  - key: PROBE_TOKEN
+    description: >-
+      The token PUT /probe takes, so that only someone who reads it from this consumer's Vault entry
+      can overwrite the probe text. The platform generates it at onboarding.
+    required: true
+    generate: hex32

@@ -1,6 +1,6 @@
 apiVersion: v2
 name: hostyour-demo-consumer
 version: 0.1.0
-description: The demo consumer of the hostyour platform, one pod with no data service.
+description: The demo consumer of the hostyour platform, with its own Redis and MariaDB.
 type: application
 appVersion: "0.1.0"

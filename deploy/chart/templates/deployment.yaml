@@ -30,9 +30,23 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - { name: http, containerPort: 8080 }
+          env:
+            # The connection strings the provisioner writes into each ServiceClaim's Secret. Until a
+            # claim has reconciled, the pod waits in CreateContainerConfigError and starts once it has.
+            - name: REDIS_URI
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.redis.secretName }}, key: REDIS_URI }
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.mariadb.secretName }}, key: DATABASE_URL }
+            - name: PROBE_TOKEN
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.appSecretName }}, key: PROBE_TOKEN }
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             periodSeconds: 10
+          # Liveness asks only whether the process serves: an outage of Redis or MariaDB takes the pod
+          # out of the Service (readiness) and does not restart it.
           livenessProbe:
             tcpSocket: { port: http }
             initialDelaySeconds: 20

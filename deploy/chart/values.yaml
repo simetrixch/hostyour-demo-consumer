@@ -4,9 +4,18 @@ image:
   pullPolicy: IfNotPresent
   pullSecretName: hostyour-demo-consumer-registry-pull
 clusterIssuer: ""   # empty: the installation's own, read from global.clusterIssuer
-# Delivered by the platform's consumers ApplicationSet: the unit's host.
+# Delivered by the platform's consumers ApplicationSet: the unit's host and the manifest's databases
+# (handed as mongodb.databases for every data service).
 unitHost: ""
+mongodb:
+  databases: []
+redis:
+  secretName: hostyour-demo-consumer-redis
+mariadb:
+  secretName: hostyour-demo-consumer-mariadb
+# The Secret the ExternalSecret materializes from this consumer's Vault entry; it carries PROBE_TOKEN.
+appSecretName: hostyour-demo-consumer-app
 app:
   resources:
-    requests: { cpu: "10m", memory: "32Mi" }
-    limits:   { cpu: "100m", memory: "64Mi" }
+    requests: { cpu: "20m", memory: "64Mi" }
+    limits:   { cpu: "200m", memory: "128Mi" }
