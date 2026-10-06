@@ -37,6 +37,13 @@ for stage in dev test; do
     [ "$(pick ServiceClaim "$claim" '.spec.secretName' <<<"$out")" = "hostyour-demo-consumer-$claim" ] \
       || fail "$stage claim $claim writes another Secret than the app reads"
   done
+  # The token reaches the pod only when the ExternalSecret fills the Secret the pod reads, through the
+  # store this chart creates, which logs in as the account this chart creates, bound to this stage.
+  store="$(yq -r 'select(.kind == "SecretStore") | .metadata.name + " " + .spec.provider.vault.auth.kubernetes.serviceAccountRef.name' <<<"$out")"
+  [ "$(pick ExternalSecret hostyour-demo-consumer-app '.spec.target.name + " " + .spec.secretStoreRef.name' <<<"$out")" = "hostyour-demo-consumer-app ${store%% *}" ] \
+    || fail "$stage app Secret is filled into another Secret, or through a store the chart does not create"
+  [ "$(pick ServiceAccount "${store##* }" '.metadata.annotations["vault.hashicorp.com/alias-metadata-stage"]' <<<"$out")" = "$stage" ] \
+    || fail "$stage SecretStore logs in as an account the chart does not create, or one not bound to this stage"
   [ "$(pick ExternalSecret hostyour-demo-consumer-app '.spec.dataFrom[0].extract.key' <<<"$out")" = "$stage/consumer/hostyour-demo-consumer/app" ] \
     || fail "$stage app Secret is not read from this consumer's own Vault entry"
   [ "$(pick ServiceClaim redis '.spec | has("keyPatterns") or has("channelPatterns")' <<<"$out")" = "false" ] \
