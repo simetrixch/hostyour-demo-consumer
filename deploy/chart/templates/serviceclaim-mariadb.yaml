@@ -9,7 +9,6 @@ metadata:
     {{- include "demo.labels" . | nindent 4 }}
 spec:
   service: mariadb
-  {{- $_ := required "mongodb.databases is delivered by the platform from the manifest's databases" (first (.Values.mongodb.databases | default list)) }}
   databases:
-    {{- toYaml .Values.mongodb.databases | nindent 4 }}
+    {{- toYaml (required "mongodb.databases is delivered by the platform from the manifest's databases" .Values.mongodb.databases) | nindent 4 }}
   secretName: {{ .Values.mariadb.secretName }}

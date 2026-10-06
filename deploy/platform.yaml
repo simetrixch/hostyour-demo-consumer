@@ -17,3 +17,10 @@ databases: [demo_probe]
 builds:
   - name: hostyour-demo-consumer
     containerfile: Containerfile
+secrets:
+  - key: PROBE_TOKEN
+    description: >-
+      The token PUT /probe takes, so that only someone who reads it from this consumer's Vault entry
+      can overwrite the probe text. The platform generates it at onboarding.
+    required: true
+    generate: hex32

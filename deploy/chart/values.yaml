@@ -13,6 +13,8 @@ redis:
   secretName: hostyour-demo-consumer-redis
 mariadb:
   secretName: hostyour-demo-consumer-mariadb
+# The Secret the ExternalSecret materializes from this consumer's Vault entry; it carries PROBE_TOKEN.
+appSecretName: hostyour-demo-consumer-app
 app:
   resources:
     requests: { cpu: "20m", memory: "64Mi" }
