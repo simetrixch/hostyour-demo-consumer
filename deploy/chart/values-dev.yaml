@@ -2,4 +2,4 @@
 builds:
   - name: hostyour-demo-consumer
     image: hostyour-demo-consumer
-    tag: "0.0.0-placeholder"
+    tag: "0.8.374-stable-20261007003602-4bf6217"
