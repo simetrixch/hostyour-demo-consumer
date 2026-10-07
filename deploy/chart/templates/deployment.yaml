@@ -32,7 +32,7 @@ spec:
             - { name: http, containerPort: 8080 }
           env:
             # The connection strings the provisioner writes into each ServiceClaim's Secret. The claims
-            # stand in wave -1, so these Secrets exist before this pod starts.
+            # and the ExternalSecret stand in wave -1, so every Secret this pod reads exists before it starts.
             - name: REDIS_URI
               valueFrom:
                 secretKeyRef: { name: {{ .Values.redis.secretName }}, key: REDIS_URI }
