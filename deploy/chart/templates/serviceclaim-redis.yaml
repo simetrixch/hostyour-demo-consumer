@@ -7,6 +7,10 @@ metadata:
   name: redis
   labels:
     {{- include "demo.labels" . | nindent 4 }}
+  annotations:
+    # Before the Deployment's wave 0: Argo CD holds the next wave until this claim is Ready, and the
+    # provisioner marks it Ready only once it has written the Secret the pod reads.
+    argocd.argoproj.io/sync-wave: "-1"
 spec:
   service: redis
   secretName: {{ .Values.redis.secretName }}
