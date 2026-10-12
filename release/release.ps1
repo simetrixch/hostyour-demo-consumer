@@ -14,6 +14,11 @@
   ref is pushed at that release's own commit, whatever is checked out. It is how a unit goes back to
   an earlier release (hostyour-manager#299).
 
+  -From mints the release on the commit it names instead of on HEAD: the version is stamped on top of
+  that commit, the tag and the deploy ref are pushed, and no branch moves. It is how a release that
+  stands on one channel reaches a stage of another with the same code. It leaves HEAD detached at the
+  release commit, and it refuses to mint a version and channel that already have a tag.
+
   It:
     1. Validates version, channel and stage.
     2. Refuses a dirty worktree.
@@ -22,7 +27,8 @@
        BEFORE anything is minted.
     5. MINT-ONCE: exactly one release tag per (version, channel). The first run stamps the version
        into package.json where the repo has one, mints <x.y.z>-<channel>-<ts14> (ts14 = UTC
-       yyyyMMddHHmmss) on HEAD and pushes the commit + the tag. A later run for the SAME
+       yyyyMMddHHmmss) on HEAD and pushes the commit + the tag (under -From, on the commit it names,
+       the tag alone). A later run for the SAME
        version+channel REUSES that tag - that is how a release reaches a further stage without being
        rebuilt: the same commit, the same image, one more stage. A VERSION NAMES ONE COMMIT: a rerun
        whose tag stands on origin on a commit other than HEAD is refused before any push, and the
@@ -63,6 +69,9 @@
   ./release/release.ps1 0.5.000 stable prod -Existing
 
 .EXAMPLE
+  ./release/release.ps1 0.5.000 beta test -From 1f3c9ab
+
+.EXAMPLE
   ./release/release.ps1 0.3.001 stable
 #>
 [CmdletBinding()]
@@ -73,7 +82,8 @@ param(
   # turned into, and its refusal is not the bash twin's sentence.
   [Parameter(Mandatory = $true, Position = 1)][string]$Channel,
   [Parameter(Position = 2)][string]$Stage = '',
-  [switch]$Existing
+  [switch]$Existing,
+  [string]$From = ''
 )
 $ErrorActionPreference = 'Stop'
 # `none` is how a form that must send a value says "no stage" (the Release workflow's choice input).
@@ -386,6 +396,14 @@ git rev-parse --is-inside-work-tree 2>$null | Out-Null
 if ($LASTEXITCODE -ne 0) { Die 'not inside a git repository' }
 if (git status --porcelain) { Die 'worktree is dirty - commit or stash before releasing' }
 
+# -From NAMES THE COMMIT THE RELEASE IS MINTED ON, resolved now: the mint moves HEAD off it.
+if ($From -and $Existing) { Die '--from mints a new release on the commit it names and --existing mints none - give one of them. Nothing was pushed.' }
+$fromSha = ''
+if ($From) {
+  $fromSha = (git rev-parse --verify --quiet "$From^{commit}" | Select-Object -First 1)
+  if ($LASTEXITCODE -ne 0 -or -not $fromSha) { Die "--from $From names no commit of this repository. Nothing was pushed." }
+}
+
 # Anchor the manifest read at the repo root so it resolves whether the script is run from the
 # repo root or from inside release/ (git tag/push are already repo-relative, not cwd-relative).
 $root = (git rev-parse --show-toplevel 2>$null)
@@ -566,6 +584,12 @@ try {
     }
   }
 
+  # A MINT UNDER -From NEEDS A VERSION AND CHANNEL NOBODY HAS TAGGED: a tag that stands already is the
+  # release, and it names the commit it names.
+  if ($fromSha -and $releaseTags.Count -gt 0) {
+    Die "$($releaseTags[-1]) exists, so $Version-$Channel cannot be minted again on $From`: a version names one commit. Nothing was pushed."
+  }
+
   # A VERSION NAMES ONE COMMIT. A tag that survived the residue rule and names a commit other than
   # HEAD is on origin, and origin's tag is the release: what stands at HEAD is a different tree, and
   # the version cannot name both. Reusing the tag would push its commit as the deploy ref from
@@ -609,11 +633,19 @@ try {
   else {
     $ts14 = (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmss')
     $tag = "$Version-$Channel-$ts14"
+    # UNDER -From THE STAMP IS MADE ON THE COMMIT NAMED, and only the tag leaves this machine: the
+    # stamp commit belongs to no branch, so the default branch does not move.
+    if ($fromSha) {
+      git checkout --quiet --detach $fromSha
+      if ($LASTEXITCODE -ne 0) { Die "$From could not be checked out - nothing was minted" }
+    }
     Set-ManifestVersion $root $Version $tag
     git tag -a $tag -m "release $tag"
     if ($LASTEXITCODE -ne 0) { Die "the release tag $tag could not be created - nothing was pushed" }
-    git push origin $releasePush
-    if ($LASTEXITCODE -ne 0) { Die "the release commit for $tag could not be pushed - deploy/after-release was not run" }
+    if (-not $fromSha) {
+      git push origin $releasePush
+      if ($LASTEXITCODE -ne 0) { Die "the release commit for $tag could not be pushed - deploy/after-release was not run" }
+    }
     git push origin "refs/tags/$tag"
     if ($LASTEXITCODE -ne 0) { Die "the release tag $tag could not be pushed - deploy/after-release was not run" }
     Say "minted $tag"

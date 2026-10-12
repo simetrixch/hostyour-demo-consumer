@@ -20,7 +20,9 @@
 # that publishes declares `packageManager` (pnpm) in its root package.json and
 # keeps every package it publishes inside its pnpm workspace. Only a release
 # commit on the default branch is published, so a tag pushed onto a commit of
-# another branch publishes nothing. The token is the repository's GITHUB_TOKEN,
+# another branch publishes nothing; the one exception is a run dispatched with
+# `from`, whose stamp commit stands off every branch and is published when it
+# differs from the default branch in nothing but the stamped manifest versions. The token is the repository's GITHUB_TOKEN,
 # so the registries served are GitHub Packages; a package that names another
 # registry fails at its publish.
 name: Release
@@ -60,6 +62,11 @@ on:
         required: false
         type: boolean
         default: false
+      from:
+        description: "Commit the new release is minted on instead of the newest one: the code of a release that stands on another channel (release.sh --from)"
+        required: false
+        type: string
+        default: ""
   # The release tag alone, and not the deploy ref: `*` matches no `/`, so
   # deploy/<stage>/<tag> never matches, and the fourteen digit classes admit no
   # suffix. One pattern per channel, because a filter pattern has no alternation.
@@ -94,7 +101,8 @@ jobs:
           CHANNEL: ${{ inputs.channel }}
           STAGE: ${{ inputs.stage }}
           EXISTING: ${{ inputs.existing && '--existing' || '' }}
-        run: bash release/release.sh "$VERSION" "$CHANNEL" "$STAGE" $EXISTING
+          FROM: ${{ inputs.from }}
+        run: bash release/release.sh "$VERSION" "$CHANNEL" "$STAGE" $EXISTING ${FROM:+--from "$FROM"}
 
   publish:
     needs: release
@@ -133,17 +141,42 @@ jobs:
       # branch is what a repository reviews, so nothing else is published. The
       # branch is read again because actions/checkout sets it, in a dispatched
       # run, to the commit the run started at, which is behind the release
-      # commit the job `release` pushed.
+      # commit the job `release` pushed. A run dispatched with `from` minted its
+      # stamp commit on the code of a release that stands, and pushed the tag
+      # alone, so that commit is on no branch: it passes when nothing but the
+      # stamped version fields of manifests differ from the last commit it shares
+      # with the default branch.
       - name: Refuse a release commit that is not on the default branch
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          FROM: ${{ inputs.from }}
         run: |
           set -euo pipefail
           if ! git fetch --quiet origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"; then
             echo "publish: ${DEFAULT_BRANCH} could not be read from origin, so whether the release commit is on it is unknown - nothing is published" >&2
             exit 1
           fi
-          if ! git merge-base --is-ancestor HEAD "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+          # Every changed path is a manifest that stands on both sides, and each equals its
+          # base as JSON once the fields the stamp writes are deleted: the top-level version of a
+          # package.json, and the version of the root and of the workspace members of a lockfile.
+          stamp_only() {
+            [ -n "$FROM" ] || return 1
+            base="$(git merge-base HEAD "refs/remotes/origin/${DEFAULT_BRANCH}")" || return 1
+            changed="$(git -c core.quotePath=false diff --no-renames --name-status "$base" HEAD)" || return 1
+            [ -n "$changed" ] || return 0
+            while IFS=$'\t' read -r status path; do
+              [ "$status" = M ] || return 1
+              case "$path" in
+                package.json|*/package.json) unstamped='del(.version)' ;;
+                package-lock.json|*/package-lock.json) unstamped='del(.version) | if .packages then .packages |= with_entries(if (.key | test("(^|/)node_modules/")) then . else .value |= del(.version) end) else . end' ;;
+                *) return 1 ;;
+              esac
+              before="$(git show "${base}:${path}" | jq -S "$unstamped")" || return 1
+              after="$(git show "HEAD:${path}" | jq -S "$unstamped")" || return 1
+              [ "$before" = "$after" ] || return 1
+            done <<< "$changed"
+          }
+          if ! git merge-base --is-ancestor HEAD "refs/remotes/origin/${DEFAULT_BRANCH}" && ! stamp_only; then
             echo "publish: the release commit $(git rev-parse --short=7 HEAD) is not on ${DEFAULT_BRANCH}, so nothing of it is published" >&2
             exit 1
           fi

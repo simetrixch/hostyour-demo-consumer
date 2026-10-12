@@ -6,13 +6,20 @@
 # equivalent in behaviour.
 #
 # USAGE (run from the repo root)
-#   ./release/release.sh <x.y.z> <stable|beta|alpha> <dev|test|prod> [--existing]
+#   ./release/release.sh <x.y.z> <stable|beta|alpha> <dev|test|prod> [--existing] [--from <commit>]
 #   ./release/release.sh <x.y.z> <stable|beta|alpha>     (a library)
 #
 # --existing puts a release that already stands on origin on the stage and
 # mints nothing: the deploy ref is pushed at that release's own commit,
 # whatever is checked out. It is how a unit goes back to an earlier release
 # (hostyour-manager#299).
+#
+# --from mints the release on the commit it names instead of on HEAD: the
+# version is stamped on top of that commit, the tag and the deploy ref are
+# pushed, and no branch moves. It is how a release that stands on one channel
+# reaches a stage of another with the same code. It leaves HEAD detached at the
+# release commit, and it refuses to mint a version and channel that already
+# have a tag.
 #
 # THE THREE INPUTS
 #   version  — x.y.z; the third position is written with three digits,
@@ -34,7 +41,8 @@
 #   5. MINT-ONCE: exactly one release tag per (version, channel). The first run
 #      stamps the version into package.json where the repo has one, mints
 #      <x.y.z>-<channel>-<ts14> (ts14 = UTC yyyyMMddHHmmss) on HEAD and pushes
-#      the commit + the tag. A later run for the SAME version+channel REUSES
+#      the commit + the tag (under --from, on the commit it names, the tag
+#      alone). A later run for the SAME version+channel REUSES
 #      that tag — that is how a release reaches a further stage without being
 #      rebuilt: the same commit, the same image, one more stage. A VERSION
 #      NAMES ONE COMMIT: a rerun whose tag stands on origin on a commit other
@@ -253,22 +261,27 @@ pin_branch() {
   die "the pin of ${STAGE} to ${TAG}-${SHA7} could not be pushed to ${branch} of ${PLATFORM_REPO} in 5 attempts"
 }
 
-USAGE="usage: release/release.sh <x.y.z> <stable|beta|alpha> [<dev|test|prod>] [--existing]"
+USAGE="usage: release/release.sh <x.y.z> <stable|beta|alpha> [<dev|test|prod>] [--existing] [--from <commit>]"
 VERSION="${1:-}"
 CHANNEL="${2:-}"
 STAGE=""
 EXISTING_ONLY=""
+FROM=""
 # --existing stands before or after the stage, as the twin's switch does, and a release without a
 # stage has nothing to put before it. Guarded by the count because bash 3.2 calls an empty "$@"
 # unbound under set -u.
 if [ $# -gt 2 ]; then
   STAGE_GIVEN=""
+  FROM_NEXT=""
   for arg in "${@:3}"; do
+    if [ -n "$FROM_NEXT" ]; then FROM="$arg"; FROM_NEXT=""; continue; fi
     case "$arg" in
       --existing) EXISTING_ONLY=yes ;;
+      --from) FROM_NEXT=yes ;;
       *) [ -z "$STAGE_GIVEN" ] || die "$USAGE"; STAGE="$arg"; STAGE_GIVEN=yes ;;
     esac
   done
+  [ -z "$FROM_NEXT" ] || die "$USAGE"
 fi
 # `none` is how a form that must send a value says "no stage" (the Release workflow's choice input).
 [ "$STAGE" = "none" ] && STAGE=""
@@ -295,6 +308,13 @@ fi
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
 [ -z "$(git status --porcelain)" ] || die "worktree is dirty - commit or stash before releasing"
+
+# --from NAMES THE COMMIT THE RELEASE IS MINTED ON, resolved now: the mint moves HEAD off it.
+[ -z "$FROM" ] || [ -z "$EXISTING_ONLY" ] || die "--from mints a new release on the commit it names and --existing mints none - give one of them. Nothing was pushed."
+FROM_SHA=""
+if [ -n "$FROM" ]; then
+  FROM_SHA="$(git rev-parse --verify --quiet "${FROM}^{commit}")" || die "--from ${FROM} names no commit of this repository. Nothing was pushed."
+fi
 
 # Anchor the manifest read at the repo root so it resolves whether the script is run from the
 # repo root or from inside release/ (git tag/push are already repo-relative, not cwd-relative).
@@ -444,6 +464,12 @@ if [ -n "$EXISTING_ONLY" ] \
   die "no release ${VERSION}-${CHANNEL} stands on origin, so there is none to put on ${STAGE}. Nothing was pushed."
 fi
 
+# A MINT UNDER --from NEEDS A VERSION AND CHANNEL NOBODY HAS TAGGED: a tag that stands already is the
+# release, and it names the commit it names.
+if [ -n "$FROM_SHA" ] && [ -n "$EXISTING" ]; then
+  die "${EXISTING} exists, so ${VERSION}-${CHANNEL} cannot be minted again on ${FROM}: a version names one commit. Nothing was pushed."
+fi
+
 # A VERSION NAMES ONE COMMIT. A tag that survived the residue rule and names a commit other than
 # HEAD is on origin, and origin's tag is the release: what stands at HEAD is a different tree, and
 # the version cannot name both. Reusing the tag would push its commit as the deploy ref from a
@@ -483,11 +509,18 @@ if [ -n "$EXISTING" ]; then
 else
   TS14="$(date -u +%Y%m%d%H%M%S)"
   TAG="${VERSION}-${CHANNEL}-${TS14}"
+  # UNDER --from THE STAMP IS MADE ON THE COMMIT NAMED, and only the tag leaves this machine: the
+  # stamp commit belongs to no branch, so the default branch does not move.
+  if [ -n "$FROM_SHA" ]; then
+    git checkout --quiet --detach "$FROM_SHA" || die "${FROM} could not be checked out - nothing was minted"
+  fi
   stamp_manifest_version
   git tag -a "$TAG" -m "release $TAG" \
     || die "the release tag ${TAG} could not be created - nothing was pushed"
-  git push origin "$RELEASE_PUSH" \
-    || die "the release commit for ${TAG} could not be pushed - deploy/after-release was not run"
+  if [ -z "$FROM_SHA" ]; then
+    git push origin "$RELEASE_PUSH" \
+      || die "the release commit for ${TAG} could not be pushed - deploy/after-release was not run"
+  fi
   git push origin "refs/tags/${TAG}" \
     || die "the release tag ${TAG} could not be pushed - deploy/after-release was not run"
   say "minted ${TAG}"
