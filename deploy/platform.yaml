@@ -6,7 +6,7 @@ kind: ConsumerManifest
 name: hostyour-demo-consumer
 host: demo
 owner: platform
-envs: [dev, test]
+envs: [dev, test, prod]
 chart:
   path: deploy/chart
 services: [redis, mariadb, registry-pull]
