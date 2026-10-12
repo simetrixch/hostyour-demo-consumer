@@ -1,0 +1,5 @@
+# The image pin the platform's release bump writes for this stage.
+builds:
+  - name: hostyour-demo-consumer
+    image: hostyour-demo-consumer
+    tag: "0.0.0-placeholder"
