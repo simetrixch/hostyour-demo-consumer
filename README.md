@@ -37,7 +37,7 @@ A failed request answers a fixed text; what went wrong stands in the consumer's 
 - `deploy/chart`: the Deployment, its Service and Ingress, the claims `redis`, `mariadb` and `registry-pull`, and the ExternalSecret that brings `PROBE_TOKEN` from Vault.
 - `Containerfile`: the image the platform's build plane builds from a release.
 
-The release kit (`release/`) and the build webhook come from the platform when the consumer is onboarded.
+The build webhook comes from the platform when the consumer is onboarded. A release is started in the Manager (Release… on the consumer's card), which tags the commit chosen there; nothing release-specific lives in this repository.
 
 ## Checks
 
