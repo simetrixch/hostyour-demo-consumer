@@ -1,6 +1,6 @@
 {
   "name": "hostyour-demo-consumer",
-  "version": "0.8.400",
+  "version": "0.8.401",
   "private": true,
   "description": "A demo consumer of the hostyour platform: one Redis key and one MariaDB row, written and read back.",
   "type": "module",
