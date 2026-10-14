@@ -47,7 +47,7 @@ The checks need Node.js 22, Helm 3 and yq 4 (mikefarah).
 bash scripts/check.sh
 ```
 
-On Windows, `pwsh scripts/check.ps1` runs the same file. It runs the probe's tests and renders the chart for every stage, each with the planted defect it must catch.
+It runs the probe's tests and renders the chart for every stage, each with the planted defect it must catch.
 
 **What only the live proof shows.** The tests run the probe against in-memory stand-ins for Redis and MariaDB. Two things therefore stand unproven until the live proof has run: whether the SQL is accepted by a real MariaDB (the upsert and the missing-table answer), and whether the claims are accepted by the platform's provisioner.
 
