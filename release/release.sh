@@ -2,8 +2,6 @@
 # ===========================================================================
 # release.sh — put a release of this repo on ONE stage, or release a library,
 # which deploys nothing. Lives in release/; copied here by the platform.
-# PowerShell twin: release.ps1 (same folder). The two are held byte-for-byte
-# equivalent in behaviour.
 #
 # USAGE (run from the repo root)
 #   ./release/release.sh <x.y.z> <stable|beta|alpha> <dev|test|prod> [--existing] [--from <commit>]
@@ -59,9 +57,9 @@
 #   7. Where `platformRepo` is declared: waits for this repo's own
 #      release-images run and writes the image pin into that tree, on the
 #      trunk and on every install branch whose cluster RUNS this unit.
-#   8. Where the repository supplies deploy/after-release.sh and .ps1: runs
-#      its own spelling last, with the tag, the release commit and the stage
-#      (`none` for a library), from the repository root. A failure turns the
+#   8. Where the repository supplies deploy/after-release.sh: runs it last,
+#      with the tag, the release commit and the stage (`none` for a library),
+#      from the repository root. A failure turns the
 #      release red; the release itself stands.
 #
 # THE THREE SHAPES THIS ONE SCRIPT SERVES, and what tells them apart
@@ -88,13 +86,8 @@
 set -euo pipefail
 
 # WHAT THIS SCRIPT PRINTS, AND WHO WRITES THE NEWLINE. Every line it composes is ASCII, a path it names
-# is printed as UTF-8, and every line ends with the
-# one \n written here, because neither is the host's to choose. A PowerShell host ends a line with
-# two bytes where a shell writes one, and [Console]::Error.WriteLine writes in the console's code
-# page, which turns a printed em dash into a different byte on a Windows console — so the twins
-# answered differently for two reasons that have nothing to do with the release, and the two are
-# held to being byte-for-byte the same. Comments carry whatever characters they like; only what is
-# PRINTED is bound.
+# is printed as UTF-8, and every line ends with the one \n written here, because neither is the
+# host's to choose. Comments carry whatever characters they like; only what is PRINTED is bound.
 line() { printf '%s\n' "$*"; }
 say() { line "release: $*"; }
 warn() { line "release: $*" >&2; }
@@ -267,8 +260,8 @@ CHANNEL="${2:-}"
 STAGE=""
 EXISTING_ONLY=""
 FROM=""
-# --existing stands before or after the stage, as the twin's switch does, and a release without a
-# stage has nothing to put before it. Guarded by the count because bash 3.2 calls an empty "$@"
+# --existing stands before or after the stage, and a release without a stage has nothing to put
+# before it. Guarded by the count because bash 3.2 calls an empty "$@"
 # unbound under set -u.
 if [ $# -gt 2 ]; then
   STAGE_GIVEN=""
@@ -349,19 +342,13 @@ else
 fi
 
 # THE REPOSITORY'S OWN STEP AFTER THE RELEASE. A repository that needs one more act after every release
-# supplies deploy/after-release.sh and deploy/after-release.ps1. They stand outside release/, which a
-# kit replace rewrites whole, so the replace never takes them away. Each spelling runs its own twin,
-# so a repository carrying only one would release differently on Linux and Windows: refused here,
-# before anything is minted or pushed. The step runs last, with the tag, the release commit and the
-# stage (`none` for a library), from the repository root. A failure turns the release red, and the
-# release itself stands.
+# supplies deploy/after-release.sh. It stands outside release/, which a kit replace rewrites whole, so
+# the replace never takes it away. The step runs last, with the tag, the release commit and the stage
+# (`none` for a library), from the repository root. A failure turns the release red, and the release
+# itself stands.
 AFTER_RELEASE=""
-if [ -f "${ROOT}/deploy/after-release.sh" ] && [ -f "${ROOT}/deploy/after-release.ps1" ]; then
+if [ -f "${ROOT}/deploy/after-release.sh" ]; then
   AFTER_RELEASE="deploy/after-release.sh"
-elif [ -f "${ROOT}/deploy/after-release.sh" ]; then
-  die "deploy/after-release.sh stands without its twin deploy/after-release.ps1 - each release script runs its own spelling, so a repository supplies both or neither. Nothing was pushed."
-elif [ -f "${ROOT}/deploy/after-release.ps1" ]; then
-  die "deploy/after-release.ps1 stands without its twin deploy/after-release.sh - each release script runs its own spelling, so a repository supplies both or neither. Nothing was pushed."
 fi
 after_release() {
   [ -n "$AFTER_RELEASE" ] || return 0
@@ -598,12 +585,11 @@ else
   # THE PIN GRAMMAR AND NOTHING ELSE: builds[]{name,image,tag}, in the values file of the stage
   # this release is going to, and beside a build's tag what its pinValues name. Read and written by
   # name rather than by line, so a file whose entries are ordered differently is still pinned and a
-  # file that carries none is left alone. The PowerShell twin is Write-StagePin; the two write the
-  # same bytes.
+  # file that carries none is left alone.
   cat > "$PINNER" <<'PIN'
 import glob, os, re, sys
-# ONE \n ENDS WHAT THIS PRINTS, as the PowerShell twin ends it. A Windows python ends a printed line
-# with \r\n, the shell's $(...) keeps the \r, and every path the answer names would then carry it.
+# ONE \n ENDS WHAT THIS PRINTS, set here rather than left to the platform's line ending: the shell's
+# $(...) keeps a \r, and every path the answer names would then carry it.
 sys.stdout.reconfigure(newline=chr(10))
 tree, stage, image_tag, manifest = sys.argv[1:5]
 text = open(manifest, encoding="utf-8").read()
