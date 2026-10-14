@@ -1,5 +1,5 @@
 # Release — put a release of this repository on one stage, or release a library,
-# from the GitHub UI; and publish its npm packages from the release tag.
+# from the GitHub UI.
 #
 # The job `release` is a thin wrapper around release/release.sh: it checks out
 # the repo, sets a bot git identity, and runs the same dumb client an operator
@@ -9,27 +9,14 @@
 # (refs/tags/deploy/<stage>/<release-tag>), not this workflow: that push fires
 # this repo's external push webhook (Settings -> Webhooks -> build.<domain>)
 # into the platform's build plane, which runs the release build. A library
-# (stage `none`) pushes no deploy ref: its release tag is the release.
-#
-# THE JOB `publish` publishes every tracked package.json that is not private and
-# names publishConfig.registry, at the version release.sh stamped into it, from
-# the release tag. It runs in two ways, because a push made with GITHUB_TOKEN
-# starts no workflow: inside a dispatched run, after the job `release`; and
-# alone, on a release tag a person pushed by running release.sh on a machine.
-# A repository with nothing to publish ends the job at its scan. A repository
-# that publishes declares `packageManager` (pnpm) in its root package.json and
-# keeps every package it publishes inside its pnpm workspace. Only a release
-# commit on the default branch is published, so a tag pushed onto a commit of
-# another branch publishes nothing; the one exception is a run dispatched with
-# `from`, whose stamp commit stands off every branch and is published when it
-# differs from the default branch in nothing but the stamped manifest versions. The token is the repository's GITHUB_TOKEN,
-# so the registries served are GitHub Packages; a package that names another
-# registry fails at its publish.
+# (stage `none`) pushes no deploy ref: its release tag is the release. The push
+# of the release tag fires the same webhook, and the build plane publishes the
+# repository's npm packages from that tag.
 name: Release
 
 # Show the release in the Actions run list (otherwise every run reads
 # "Release #N: Manually run by <user>" with no context on WHICH release).
-run-name: "Release ${{ github.event_name == 'push' && github.ref_name || format('{0}-{1}', inputs.version, inputs.channel) }}"
+run-name: "Release ${{ inputs.version }}-${{ inputs.channel }}"
 
 on:
   workflow_dispatch:
@@ -67,18 +54,9 @@ on:
         required: false
         type: string
         default: ""
-  # The release tag alone, and not the deploy ref: `*` matches no `/`, so
-  # deploy/<stage>/<tag> never matches, and the fourteen digit classes admit no
-  # suffix. One pattern per channel, because a filter pattern has no alternation.
-  push:
-    tags:
-      - '[0-9]+.[0-9]+.[0-9]+-alpha-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
-      - '[0-9]+.[0-9]+.[0-9]+-beta-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
-      - '[0-9]+.[0-9]+.[0-9]+-stable-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]'
 
 jobs:
   release:
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -103,163 +81,3 @@ jobs:
           EXISTING: ${{ inputs.existing && '--existing' || '' }}
           FROM: ${{ inputs.from }}
         run: bash release/release.sh "$VERSION" "$CHANNEL" "$STAGE" $EXISTING ${FROM:+--from "$FROM"}
-
-  publish:
-    needs: release
-    # `!cancelled()` because the job `release` is skipped on a tag push, and a
-    # skipped need skips this job too unless the condition says otherwise. A
-    # dispatched --existing run puts a published release on a stage again.
-    if: ${{ !cancelled() && (github.event_name == 'push' || (needs.release.result == 'success' && !inputs.existing)) }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout (full history + tags)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # A dispatched run names its release by version and channel; the tag is
-      # the one release.sh minted or reused, the newest of that pair.
-      - name: Check out the release tag
-        env:
-          VERSION: ${{ inputs.version }}
-          CHANNEL: ${{ inputs.channel }}
-        run: |
-          set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            tag="$GITHUB_REF_NAME"
-          else
-            tag="$(git tag -l "${VERSION}-${CHANNEL}-*" | sort | tail -1)"
-          fi
-          [ -n "$tag" ] || { echo "publish: no release tag ${VERSION}-${CHANNEL}-* stands on origin, so there is nothing to publish from" >&2; exit 1; }
-          git checkout --quiet "refs/tags/${tag}"
-          echo "publish: publishing from ${tag}"
-
-      # A tag is pushed by anybody who may push, onto any commit; the default
-      # branch is what a repository reviews, so nothing else is published. The
-      # branch is read again because actions/checkout sets it, in a dispatched
-      # run, to the commit the run started at, which is behind the release
-      # commit the job `release` pushed. A run dispatched with `from` minted its
-      # stamp commit on the code of a release that stands, and pushed the tag
-      # alone, so that commit is on no branch: it passes when nothing but the
-      # stamped version fields of manifests differ from the last commit it shares
-      # with the default branch.
-      - name: Refuse a release commit that is not on the default branch
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          FROM: ${{ inputs.from }}
-        run: |
-          set -euo pipefail
-          if ! git fetch --quiet origin "+refs/heads/${DEFAULT_BRANCH}:refs/remotes/origin/${DEFAULT_BRANCH}"; then
-            echo "publish: ${DEFAULT_BRANCH} could not be read from origin, so whether the release commit is on it is unknown - nothing is published" >&2
-            exit 1
-          fi
-          # Every changed path is a manifest that stands on both sides, and each equals its
-          # base as JSON once the fields the stamp writes are deleted: the top-level version of a
-          # package.json, and the version of the root and of the workspace members of a lockfile.
-          stamp_only() {
-            [ -n "$FROM" ] || return 1
-            base="$(git merge-base HEAD "refs/remotes/origin/${DEFAULT_BRANCH}")" || return 1
-            changed="$(git -c core.quotePath=false diff --no-renames --name-status "$base" HEAD)" || return 1
-            [ -n "$changed" ] || return 0
-            while IFS=$'\t' read -r status path; do
-              [ "$status" = M ] || return 1
-              case "$path" in
-                package.json|*/package.json) unstamped='del(.version)' ;;
-                package-lock.json|*/package-lock.json) unstamped='del(.version) | if .packages then .packages |= with_entries(if (.key | test("(^|/)node_modules/")) then . else .value |= del(.version) end) else . end' ;;
-                *) return 1 ;;
-              esac
-              before="$(git show "${base}:${path}" | jq -S "$unstamped")" || return 1
-              after="$(git show "HEAD:${path}" | jq -S "$unstamped")" || return 1
-              [ "$before" = "$after" ] || return 1
-            done <<< "$changed"
-          }
-          if ! git merge-base --is-ancestor HEAD "refs/remotes/origin/${DEFAULT_BRANCH}" && ! stamp_only; then
-            echo "publish: the release commit $(git rev-parse --short=7 HEAD) is not on ${DEFAULT_BRANCH}, so nothing of it is published" >&2
-            exit 1
-          fi
-
-      # Before any tool is set up, because most repositories publish nothing and
-      # some of them declare no packageManager, which pnpm/action-setup refuses.
-      - name: Find the packages to publish
-        id: scan
-        run: |
-          set -euo pipefail
-          list="$RUNNER_TEMP/publishable.tsv"
-          : > "$list"
-          git -c core.quotePath=false ls-files -- 'package.json' '*/package.json' | while IFS= read -r file; do
-            jq -e '(.private // false) == false and (.publishConfig.registry // "") != ""' "$file" >/dev/null || continue
-            printf '%s\t%s\t%s\n' "$(dirname "$file")" "$(jq -r .name "$file")" "$(jq -r .publishConfig.registry "$file")" >> "$list"
-          done
-          if [ ! -s "$list" ]; then
-            echo "publish: no package.json here is publishable (not private, with publishConfig.registry) - nothing to publish"
-            echo "found=false" >> "$GITHUB_OUTPUT"
-          else
-            cut -f2 "$list" | sed 's/^/publish: publishable /'
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - if: steps.scan.outputs.found == 'true'
-        uses: pnpm/action-setup@v4
-
-      - if: steps.scan.outputs.found == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
-      # The token for every registry a package names, and no scope: which scope
-      # a registry serves is the repository's own .npmrc, and npm reads the
-      # token variable when it runs.
-      - name: Log in to the package registries
-        if: steps.scan.outputs.found == 'true'
-        run: |
-          set -euo pipefail
-          cut -f3 "$RUNNER_TEMP/publishable.tsv" | sed -E 's#^https?://##; s#/*$##' | sort -u | while IFS= read -r host; do
-            printf '//%s/:_authToken=${NODE_AUTH_TOKEN}\n' "$host" >> "$HOME/.npmrc"
-          done
-
-      - name: Install and build the packages
-        if: steps.scan.outputs.found == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          pnpm install --frozen-lockfile
-          # A package outside the workspace is one no filter selects, so it
-          # would be published unbuilt; it is refused instead.
-          members="$(pnpm ls -r --depth -1 --json | jq -r '.[].path')"
-          filters=()
-          while IFS=$'\t' read -r dir name registry; do
-            if ! printf '%s\n' "$members" | grep -qxF "$(cd "$dir" && pwd)"; then
-              echo "publish: ${name} (${dir}) is no package of this pnpm workspace, so nothing here builds it - list its folder in pnpm-workspace.yaml" >&2
-              exit 1
-            fi
-            filters+=(--filter "${name}...")
-          done < "$RUNNER_TEMP/publishable.tsv"
-          pnpm "${filters[@]}" run --if-present build
-
-      # A version the registry already holds is skipped, so a rerun publishes
-      # nothing twice. The dist-tag is the prerelease id (beta, alpha) or latest.
-      # pnpm packs (it rewrites workspace: ranges) and npm publishes: pnpm
-      # publish always asks GitHub for an OIDC id token and warns without
-      # id-token: write, which GitHub Packages never uses; npm does not warn.
-      - name: Publish what is not yet published
-        if: steps.scan.outputs.found == 'true'
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          while IFS=$'\t' read -r dir name registry; do
-            version="$(jq -r .version "$dir/package.json")"
-            if npm view "${name}@${version}" version --registry "$registry" >/dev/null 2>&1; then
-              echo "publish: ${name}@${version} is published already"
-              continue
-            fi
-            tag=latest
-            case "$version" in *-*) tag="${version#*-}"; tag="${tag%%.*}" ;; esac
-            echo "publish: ${name}@${version} with dist-tag ${tag}"
-            tarball="$(cd "$dir" && pnpm pack --json --pack-destination "$RUNNER_TEMP/packed" | jq -er .filename)"
-            npm publish "$tarball" --tag "$tag"
-          done < "$RUNNER_TEMP/publishable.tsv"

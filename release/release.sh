@@ -74,7 +74,7 @@
 #   A LIBRARY is a manifest with no builds, no chart and no tenant: block, the
 #   one shape the release pipeline refuses as deploying nothing. No build plane
 #   reads a deploy ref of it, so it takes no stage and step 6 does not run: the
-#   tag is the release, and the Release workflow publishes its packages.
+#   tag is the release, and the build plane publishes its packages from it.
 #
 # The stage is never in the release tag — the same image reaches further stages
 # by the deploy ref alone. The ceiling below is checked LOCALLY as a courtesy so
@@ -519,7 +519,7 @@ SHA="$(git rev-list -n 1 "$TAG")"
 SHA7="${SHA:0:7}"
 
 # A LIBRARY IS RELEASED BY ITS TAG. No build plane reads a deploy ref of it and nothing is pinned, so
-# the run ends here; the Release workflow's publish job reads the tag.
+# the run ends here; the build plane's publish pipeline reads the tag.
 if [ -n "$LIBRARY" ]; then
   after_release
   say "${NAME} ${TAG} (commit ${SHA7}) is released; nothing is deployed"
